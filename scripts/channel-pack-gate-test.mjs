@@ -94,12 +94,33 @@ if (stale.length > 0) {
 // #130: marker preservation alone cannot detect arbitrary source/bundle drift.
 // Exercise the real check in CI, plus negative controls in an isolated tree.
 const root = fileURLToPath(new URL('../', import.meta.url))
-const runBuild = (cwd, args = []) => spawnSync(process.execPath, ['scripts/build-channel-pack.mjs', ...args], {
+const runBuild = (cwd, args = [], extraEnv = {}) => spawnSync(process.execPath, ['scripts/build-channel-pack.mjs', ...args], {
   cwd, encoding: 'utf8', windowsHide: true,
-  env: { ...process.env, OFM_ESBUILD_DIR: root }, timeout: 30_000,
+  env: { ...process.env, OFM_ESBUILD_DIR: root, ...extraEnv }, timeout: 30_000,
 })
-const actual = runBuild(root, ['--check'])
-check('the real source rebuild matches the shipped pack without rewriting it', actual.status, 0)
+// Native esbuild output varies by host platform even for identical input. CI
+// installs Linux's binary while contributors build on macOS/Windows; byte
+// equality there would reject a valid source tree. The universal esbuild-wasm
+// implementation is the reproducible byte oracle. It is installed only into a
+// temporary prefix, then discarded. A network or registry failure is explicit,
+// never a silent skip.
+const wasmPrefix = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-esbuild-wasm-'))
+const npmCli = process.platform === 'win32'
+  ? path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  : null
+const installed = npmCli === null
+  ? spawnSync('npm', [
+    'install', '--prefix', wasmPrefix, '--no-package-lock', '--no-save',
+    '--ignore-scripts', 'esbuild-wasm@0.25.9',
+  ], { encoding: 'utf8', windowsHide: true, timeout: 30_000 })
+  : spawnSync(process.execPath, [npmCli,
+    'install', '--prefix', wasmPrefix, '--no-package-lock', '--no-save',
+    '--ignore-scripts', 'esbuild-wasm@0.25.9',
+  ], { encoding: 'utf8', windowsHide: true, timeout: 30_000 })
+check('the pinned cross-platform esbuild-wasm oracle installs', installed.status, 0)
+if (installed.status !== 0) throw new Error(`${installed.stdout}\n${installed.stderr}`)
+const actual = runBuild(root, ['--check'], { OFM_ESBUILD_DIR: wasmPrefix })
+check('the real source rebuild matches the shipped pack under the cross-platform oracle', actual.status, 0)
 if (actual.status !== 0) console.log(`${actual.stdout}\n${actual.stderr}`)
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-pack-check-'))
 try {
@@ -129,6 +150,7 @@ try {
   check('no staged bundle survives completed checks', fs.readdirSync(path.dirname(artifact)).filter(name => name.includes('.build-')), [])
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true })
+  fs.rmSync(wasmPrefix, { recursive: true, force: true })
 }
 
 console.log(failures === 0 ? '\nall channel-pack gate checks passed' : `\n${failures} channel-pack gate check(s) failed`)
